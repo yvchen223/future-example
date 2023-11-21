@@ -3,6 +3,7 @@ use std::{
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker}, mem,
     thread::{self, JoinHandle}, time::{Duration, Instant}, collections::HashMap
 };
+use std::sync::Condvar;
 
 fn main() {
     let start = Instant::now();
@@ -28,7 +29,8 @@ fn main() {
 }
 
 fn block_on<F: Future>(mut future: F) -> F::Output {
-    let mywaker = Arc::new(MyWaker { thread: thread::current() });
+    let parker = Arc::new(Parker::default());
+    let mywaker = Arc::new(MyWaker { parker: parker.clone() });
     let waker = mywaker_into_waker(Arc::into_raw(mywaker));
 
     let mut cx = Context::from_waker(&waker);
@@ -38,16 +40,34 @@ fn block_on<F: Future>(mut future: F) -> F::Output {
     let val = loop {
         match Future::poll(future.as_mut(), &mut cx) {
             Poll::Ready(val) => break val,
-            Poll::Pending => thread::park(),
+            Poll::Pending => parker.park(),
         };
     };
     val
 }
 
+#[derive(Default)]
+struct Parker(Mutex<bool>, Condvar);
+
+impl Parker {
+    fn park(&self) {
+        let mut resumable = self.0.lock().unwrap();
+        while !*resumable {
+            resumable = self.1.wait(resumable).unwrap();
+        }
+        *resumable = false
+    }
+
+    fn unpark(&self) {
+        *self.0.lock().unwrap() = true;
+        self.1.notify_one();
+    }
+}
+
 /// The definition of our `Waker`.
 #[derive(Clone)]
 struct MyWaker {
-    thread: thread::Thread,
+    parker: Arc<Parker>
 }
 
 /// The definition of our `Future`. It keeps all the information we need.
@@ -61,7 +81,7 @@ struct Task {
 fn mywaker_wake(s: &MyWaker) {
     let waker_ptr: *const MyWaker = s;
     let waker_arc = unsafe { Arc::from_raw(waker_ptr) };
-    waker_arc.thread.unpark();
+    waker_arc.parker.unpark();
 }
 
 fn mywaker_clone(s: &MyWaker) -> RawWaker {
@@ -74,7 +94,7 @@ const VTABLE: RawWakerVTable = unsafe {
     RawWakerVTable::new(
         |s| mywaker_clone(&*(s as *const MyWaker)),  // clone
         |s| mywaker_wake(&*(s as *const MyWaker)),  // wake
-        |s| (*(s as *const MyWaker)).thread.unpark(),  // wake by ref
+        |s| (*(s as *const MyWaker)).parker.unpark(),  // wake by ref
         |s| drop(Arc::from_raw(s as *const MyWaker)),  // decrease refcount
     )
 };
